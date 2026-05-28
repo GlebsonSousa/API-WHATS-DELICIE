@@ -1,31 +1,56 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
-import qrcode from 'qrcode-terminal';
+import express from 'express';
+import qrcodeTerminal from 'qrcode-terminal';
+import qrcodeWeb from 'qrcode';
 import pino from 'pino';
-import http from 'http';
+import fs from 'fs';
 
-// --- SERVIDOR HTTP FANTASMA (Para a Render não derrubar o Bot) ---
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot da Delicie esta online e rodando!');
-}).listen(PORT, () => {
-    console.log(`🌐 Servidor HTTP nativo rodando na porta ${PORT} para a Render`);
-});
-// -----------------------------------------------------------------
+const app = express();
+app.use(express.json());
 
-// Coloque aqui a URL real da sua outra API (A que salva no banco)
+// Variáveis globais para a rota do QR Code
+let qrCodeAtual = '';
+let statusConexao = 'Aguardando inicialização...';
+
+// URL da sua outra API (A que salva no banco)
 const URL_API_RENDER = 'https://SUA-API-DELICIE-AQUI.onrender.com/webhook-whatsapp';
 
+// --- ROTAS WEB ---
+app.get('/', (req, res) => {
+    res.send(`<h2>Status do Bot: ${statusConexao}</h2><p>Acesse <a href="/qr">/qr</a> para ler o código.</p>`);
+});
+
+app.get('/qr', async (req, res) => {
+    if (statusConexao === 'Conectado') {
+        return res.send('<h2>✅ O Bot já está conectado! Não é necessário ler o QR Code.</h2>');
+    }
+    if (!qrCodeAtual) {
+        return res.send('<h2>⏳ Gerando QR Code... Atualize a página em 5 segundos.</h2>');
+    }
+    
+    try {
+        const qrImage = await qrcodeWeb.toDataURL(qrCodeAtual);
+        res.send(`
+            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:sans-serif;">
+                <h2>📱 Escaneie para conectar o Bot</h2>
+                <img src="${qrImage}" style="width: 300px; height: 300px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);"/>
+                <p style="color:gray;">Atualize a página se o código expirar (muda a cada 40s).</p>
+            </div>
+        `);
+    } catch (err) {
+        res.send('Erro ao renderizar a imagem do QR Code.');
+    }
+});
+
+// --- LÓGICA DO WHATSAPP ---
 async function iniciarBot() {
-    // Gerencia a sessão para você não precisar ler o QR Code toda hora
     const { state, saveCreds } = await useMultiFileAuthState('./sessao_whatsapp');
 
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
+        printQRInTerminal: false, // Desligamos no terminal para usar na web
         logger: pino({ level: 'silent' }),
-        // O Disfarce abaixo evita o erro 405 de bloqueio do WhatsApp
-        browser: ['Ubuntu', 'Chrome', '20.0.04'] 
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -34,34 +59,51 @@ async function iniciarBot() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n📱 Escaneie o QR Code abaixo no painel de LOGS da Render:');
-            qrcode.generate(qr, { small: true });
+            qrCodeAtual = qr;
+            statusConexao = 'Aguardando leitura do QR Code';
+            console.log('🔄 Novo QR Code gerado. Acesse a rota /qr para ler.');
+            // Opcional: mantemos no terminal também caso você olhe os logs
+            qrcodeTerminal.generate(qr, { small: true }); 
         }
 
         if (connection === 'close') {
+            statusConexao = 'Desconectado';
             const erro = lastDisconnect.error?.output?.statusCode;
-            const deveReconectar = erro !== DisconnectReason.loggedOut;
-            console.log('Conexão fechada. Motivo:', erro);
+            console.log('❌ Conexão fechada. Motivo:', erro);
             
-            if (deveReconectar) {
-                iniciarBot();
-            } else {
-                console.log('Sessão desconectada. Se precisar, apague a pasta "sessao_whatsapp".');
+            if (erro === 405) {
+                console.log('⚠️ Erro 405 (Recusado). Forçando limpeza da sessão...');
+                qrCodeAtual = ''; // Limpa o QR code antigo
+                try {
+                    fs.rmSync('./sessao_whatsapp', { recursive: true, force: true });
+                    console.log('🧹 Pasta de sessão apagada com sucesso.');
+                } catch (e) {
+                    console.log('A pasta já estava limpa.');
+                }
+                setTimeout(iniciarBot, 3000); // Tenta iniciar de novo em 3s
+            } 
+            else if (erro !== DisconnectReason.loggedOut) {
+                setTimeout(iniciarBot, 3000);
+            } 
+            else {
+                console.log('Você desconectou. Limpando dados para novo login...');
+                try { fs.rmSync('./sessao_whatsapp', { recursive: true, force: true }); } catch (e) {}
             }
         } else if (connection === 'open') {
-            console.log('\n✅ Bot conectado com sucesso! Pronto para registrar vendas.');
+            qrCodeAtual = ''; // Apaga o QR Code da memória
+            statusConexao = 'Conectado';
+            console.log('\n✅ Bot conectado e pronto para uso!');
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
-
         if (!msg.message || msg.key.fromMe) return;
 
         const textoMensagem = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
         if (textoMensagem) {
-            console.log(`\n💬 Nova mensagem recebida: "${textoMensagem}"`);
+            console.log(`💬 Mensagem: "${textoMensagem}"`);
             
             try {
                 const resposta = await fetch(URL_API_RENDER, {
@@ -73,25 +115,21 @@ async function iniciarBot() {
                 const dados = await resposta.json();
 
                 if (resposta.ok) {
-                    console.log("✅ Venda processada e salva com sucesso!");
-                    
-                    const textoConfirmacao = `*Venda Registrada com Sucesso!* ✅\n\n` +
-                                             `👤 Cliente: ${dados.dados.cliente}\n` +
-                                             `🍪 Produto: ${dados.dados.produto}\n` +
-                                             `😋 Sabor: ${dados.dados.sabor}\n` +
-                                             `📦 Quantidade: ${dados.dados.quantidade}`;
-                    
+                    const textoConfirmacao = `*Venda Registrada!* ✅\nCliente: ${dados.dados.cliente}\nProduto: ${dados.dados.produto}\nSabor: ${dados.dados.sabor}\nQtd: ${dados.dados.quantidade}`;
                     await sock.sendMessage(msg.key.remoteJid, { text: textoConfirmacao });
                 } else {
-                    console.error("⚠️ Erro retornado pela API:", dados.error);
-                    await sock.sendMessage(msg.key.remoteJid, { text: `❌ Ops, não consegui registrar a venda. Erro: ${dados.error}` });
+                    await sock.sendMessage(msg.key.remoteJid, { text: `❌ Erro: ${dados.error}` });
                 }
-
             } catch (erro) {
-                console.error("❌ Falha ao tentar conectar com a API Principal:", erro);
+                console.error("Falha ao comunicar com API:", erro);
             }
         }
     });
 }
 
-iniciarBot();
+// Inicia o Express e depois o Bot
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🌐 Servidor rodando na porta ${PORT}`);
+    iniciarBot();
+});

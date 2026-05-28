@@ -1,134 +1,97 @@
-import express from 'express';
-import { createClient } from '@supabase/supabase-js';
-import { HfInference } from '@huggingface/inference';
-import { google } from 'googleapis';
-import dotenv from 'dotenv';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode-terminal';
+import pino from 'pino';
+import http from 'http';
 
-dotenv.config();
-
-const app = express();
-app.use(express.json());
-
-// --- INICIALIZAÇÃO DOS SERVIÇOS ---
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const hf = new HfInference(process.env.HF_TOKEN);
-const MODELO_HF = "Qwen/Qwen2.5-7B-Instruct"; // Modelo open-source no Hugging Face
-
-// Autenticação do Google Sheets
-const auth = new google.auth.GoogleAuth({
-    keyFile: './google-credentials.json',
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+// --- SERVIDOR HTTP FANTASMA (Para a Render não derrubar o Bot) ---
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot da Delicie esta online e rodando!');
+}).listen(PORT, () => {
+    console.log(`🌐 Servidor HTTP nativo rodando na porta ${PORT} para a Render`);
 });
-const sheets = google.sheets({ version: 'v4', auth });
+// -----------------------------------------------------------------
 
-// --- FUNÇÃO PARA SINCRONIZAR BANCO COM PLANILHA ---
-async function sincronizarComSheets() {
-    try {
-        console.log("Iniciando sincronização com Google Sheets...");
-        
-        // 1. Busca todos os dados do Supabase ordenados por data
-        const { data: vendas, error } = await supabase
-            .from('vendas')
-            .select('data, cliente, produto, sabor, quantidade')
-            .order('data', { ascending: true });
+// Coloque aqui a URL real da sua outra API (A que salva no banco)
+const URL_API_RENDER = 'https://SUA-API-DELICIE-AQUI.onrender.com/webhook-whatsapp';
 
-        if (error) throw error;
+async function iniciarBot() {
+    // Gerencia a sessão para você não precisar ler o QR Code toda hora
+    const { state, saveCreds } = await useMultiFileAuthState('./sessao_whatsapp');
 
-        // 2. Transforma em formato de matriz (Array de Arrays)
-        const valoresParaPlanilha = [
-            ['Data', 'Cliente', 'Produto', 'Sabor', 'Quantidade'], // Cabeçalho
-            ...vendas.map(venda => [
-                new Date(venda.data).toLocaleDateString('pt-BR'),
-                venda.cliente,
-                venda.produto,
-                venda.sabor,
-                venda.quantidade
-            ])
-        ];
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        // O Disfarce abaixo evita o erro 405 de bloqueio do WhatsApp
+        browser: ['Ubuntu', 'Chrome', '20.0.04'] 
+    });
 
-        const spreadsheetId = process.env.PLANILHA_ID;
+    sock.ev.on('creds.update', saveCreds);
 
-        // 3. Atualiza a aba "Vendas" limpando e reescrevendo tudo
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: 'Vendas!A1:E',
-            valueInputOption: 'USER_ENTERED',
-            requestBody: { values: valoresParaPlanilha }
-        });
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-        console.log("Sincronização concluída com sucesso!");
-    } catch (error) {
-        console.error("Erro na sincronização com Sheets:", error);
-    }
-}
-
-// --- ROTA DE TESTE ---
-app.get('/Status', (req, res) => {
-    res.send({ status: 'Servidor rodando!' });
-});
-
-// --- ROTA PRINCIPAL (WEBHOOK DO WHATSAPP) ---
-app.post('/webhook-whatsapp', async (req, res) => {
-    try {
-        const mensagemUsuario = req.body.mensagem;
-
-        if (!mensagemUsuario) {
-            return res.status(400).send({ error: 'Mensagem não fornecida.' });
+        if (qr) {
+            console.log('\n📱 Escaneie o QR Code abaixo no painel de LOGS da Render:');
+            qrcode.generate(qr, { small: true });
         }
 
-        console.log(`Processando mensagem: "${mensagemUsuario}"`);
+        if (connection === 'close') {
+            const erro = lastDisconnect.error?.output?.statusCode;
+            const deveReconectar = erro !== DisconnectReason.loggedOut;
+            console.log('Conexão fechada. Motivo:', erro);
+            
+            if (deveReconectar) {
+                iniciarBot();
+            } else {
+                console.log('Sessão desconectada. Se precisar, apague a pasta "sessao_whatsapp".');
+            }
+        } else if (connection === 'open') {
+            console.log('\n✅ Bot conectado com sucesso! Pronto para registrar vendas.');
+        }
+    });
 
-        // 1. Extração de dados via IA (Hugging Face)
-        const response = await hf.chatCompletion({
-            model: MODELO_HF,
-            messages: [
-                { 
-                    role: "system", 
-                    content: "Você é um assistente de extração de dados. Retorne APENAS um JSON válido, sem markdown, sem explicações. Chaves obrigatórias: 'cliente' (use 'Não informado' se não houver), 'produto', 'sabor', 'quantidade' (como número inteiro)." 
-                },
-                { 
-                    role: "user", 
-                    content: `Mensagem: "${mensagemUsuario}"` 
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+
+        if (!msg.message || msg.key.fromMe) return;
+
+        const textoMensagem = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+        if (textoMensagem) {
+            console.log(`\n💬 Nova mensagem recebida: "${textoMensagem}"`);
+            
+            try {
+                const resposta = await fetch(URL_API_RENDER, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mensagem: textoMensagem })
+                });
+
+                const dados = await resposta.json();
+
+                if (resposta.ok) {
+                    console.log("✅ Venda processada e salva com sucesso!");
+                    
+                    const textoConfirmacao = `*Venda Registrada com Sucesso!* ✅\n\n` +
+                                             `👤 Cliente: ${dados.dados.cliente}\n` +
+                                             `🍪 Produto: ${dados.dados.produto}\n` +
+                                             `😋 Sabor: ${dados.dados.sabor}\n` +
+                                             `📦 Quantidade: ${dados.dados.quantidade}`;
+                    
+                    await sock.sendMessage(msg.key.remoteJid, { text: textoConfirmacao });
+                } else {
+                    console.error("⚠️ Erro retornado pela API:", dados.error);
+                    await sock.sendMessage(msg.key.remoteJid, { text: `❌ Ops, não consegui registrar a venda. Erro: ${dados.error}` });
                 }
-            ],
-            max_tokens: 150,
-            temperature: 0.1
-        });
-        
-        let textoResposta = response.choices[0].message.content;
-        textoResposta = textoResposta.replace(/```json|```/g, '').trim();
-        const dadosVenda = JSON.parse(textoResposta);
 
-        // 2. Salva no banco de dados Supabase
-        const { error: dbError } = await supabase
-            .from('vendas')
-            .insert([{ 
-                cliente: dadosVenda.cliente, 
-                produto: dadosVenda.produto, 
-                sabor: dadosVenda.sabor, 
-                quantidade: dadosVenda.quantidade 
-            }]);
+            } catch (erro) {
+                console.error("❌ Falha ao tentar conectar com a API Principal:", erro);
+            }
+        }
+    });
+}
 
-        if (dbError) throw dbError;
-
-        // 3. Aciona a sincronização com o Google Sheets
-        await sincronizarComSheets();
-
-        // 4. Retorna sucesso para a API do WhatsApp
-        res.status(200).send({ 
-            status: 'Sucesso', 
-            dados: dadosVenda, 
-            mensagem: 'Venda registrada e planilha atualizada.' 
-        });
-
-    } catch (error) {
-        console.error("Erro no fluxo principal:", error);
-        res.status(500).send({ error: 'Erro interno no processamento.' });
-    }
-});
-
-// --- INICIAR SERVIDOR ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando na porta ${PORT}`);
-});
+iniciarBot();

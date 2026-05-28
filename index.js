@@ -14,7 +14,7 @@ http.createServer((req, res) => {
 // --------------------------------------------------
 
 // Coloque aqui a URL real que a Render gerou para a sua API principal
-const URL_API_RENDER = 'https://SUA-API-DELICIE-AQUI.onrender.com/webhook-whatsapp';
+const URL_API_RENDER = 'https://deliciedb-planilha.onrender.com/webhook-whatsapp';
 
 async function iniciarBot() {
     // Gerencia a sessão para você não precisar ler o QR Code toda hora

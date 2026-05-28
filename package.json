@@ -1,0 +1,15 @@
+{
+  "name": "bot-whatsapp-delicie",
+  "version": "1.0.0",
+  "description": "Bot de captura de vendas e envio para API Render",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.6.0",
+    "qrcode-terminal": "^0.12.0",
+    "pino": "^8.19.0"
+  }
+}

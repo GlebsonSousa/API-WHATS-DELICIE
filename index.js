@@ -1,4 +1,4 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import express from 'express';
 import qrcodeTerminal from 'qrcode-terminal';
 import qrcodeWeb from 'qrcode';
@@ -13,7 +13,7 @@ let qrCodeAtual = '';
 let statusConexao = 'Aguardando inicialização...';
 
 // URL da sua outra API (A que salva no banco)
-const URL_API_RENDER = 'https://SUA-API-DELICIE-AQUI.onrender.com/webhook-whatsapp';
+const URL_API_RENDER = 'https://deliciedb-planilha.onrender.com/webhook-whatsapp';
 
 // --- ROTAS WEB ---
 app.get('/', (req, res) => {
@@ -45,12 +45,18 @@ app.get('/qr', async (req, res) => {
 // --- LÓGICA DO WHATSAPP ---
 async function iniciarBot() {
     const { state, saveCreds } = await useMultiFileAuthState('./sessao_whatsapp');
+    
+    // 1. Busca a versão oficial mais recente do WhatsApp Web direto da Meta
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`📡 Usando WhatsApp Web v${version.join('.')} (Última versão: ${isLatest})`);
 
     const sock = makeWASocket({
+        version, // 2. Força o uso da versão que acabamos de buscar
         auth: state,
-        printQRInTerminal: false, // Desligamos no terminal para usar na web
+        printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04']
+        browser: Browsers.ubuntu('Chrome'), // Disfarce de Linux costuma ser o mais estável
+        syncFullHistory: false
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -72,16 +78,16 @@ async function iniciarBot() {
             console.log('❌ Conexão fechada. Motivo:', erro);
             
             if (erro === 405) {
-                console.log('⚠️ Erro 405 (Recusado). Forçando limpeza da sessão...');
-                qrCodeAtual = ''; // Limpa o QR code antigo
+                console.log('⚠️ Erro 405 (Recusado). O WhatsApp bloqueou a geração do QR Code neste IP.');
+                qrCodeAtual = ''; 
                 try {
                     fs.rmSync('./sessao_whatsapp', { recursive: true, force: true });
-                    console.log('🧹 Pasta de sessão apagada com sucesso.');
-                } catch (e) {
-                    console.log('A pasta já estava limpa.');
-                }
-                setTimeout(iniciarBot, 3000); // Tenta iniciar de novo em 3s
-            } 
+                } catch (e) {}
+                
+                console.log('🛑 Matando o processo para evitar Loop Infinito.');
+                // Em vez de tentar de novo freneticamente, matamos o app e a Render reinicia ele com calma
+                process.exit(1); 
+            }
             else if (erro !== DisconnectReason.loggedOut) {
                 setTimeout(iniciarBot, 3000);
             } 
@@ -98,12 +104,22 @@ async function iniciarBot() {
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
+        
+        // Ignora mensagens enviadas pelo próprio bot ou mensagens vazias
         if (!msg.message || msg.key.fromMe) return;
+
+        // 🚨 O ID EXATO DO SEU GRUPO DE VENDAS
+        const ID_GRUPO_VENDAS = '120363427630567779@g.us';
+
+        // 🚨 A TRAVA: Se a mensagem não veio deste grupo específico, o bot ignora!
+        if (msg.key.remoteJid !== ID_GRUPO_VENDAS) {
+            return; 
+        }
 
         const textoMensagem = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
         if (textoMensagem) {
-            console.log(`💬 Mensagem: "${textoMensagem}"`);
+            console.log(`\n💬 Nova mensagem do grupo de Vendas: "${textoMensagem}"`);
             
             try {
                 const resposta = await fetch(URL_API_RENDER, {
@@ -112,16 +128,31 @@ async function iniciarBot() {
                     body: JSON.stringify({ mensagem: textoMensagem })
                 });
 
-                const dados = await resposta.json();
+                // Lemos a resposta como texto bruto primeiro para não quebrar
+                const textoBruto = await resposta.text();
+                
+                let dados;
+                try {
+                    dados = JSON.parse(textoBruto);
+                } catch (e) {
+                    dados = { error: textoBruto }; // Se não for JSON, tratamos como texto de erro
+                }
 
                 if (resposta.ok) {
-                    const textoConfirmacao = `*Venda Registrada!* ✅\nCliente: ${dados.dados.cliente}\nProduto: ${dados.dados.produto}\nSabor: ${dados.dados.sabor}\nQtd: ${dados.dados.quantidade}`;
-                    await sock.sendMessage(msg.key.remoteJid, { text: textoConfirmacao });
+                    console.log("✅ Render respondeu com SUCESSO!");
+                    // Imprime direto o que vier no sucesso
+                    const msgSucesso = dados.dados ? JSON.stringify(dados.dados, null, 2) : JSON.stringify(dados, null, 2);
+                    await sock.sendMessage(msg.key.remoteJid, { text: `✅ *SUCESSO:*\n${msgSucesso}` });
                 } else {
-                    await sock.sendMessage(msg.key.remoteJid, { text: `❌ Erro: ${dados.error}` });
+                    console.log(`⚠️ Render respondeu com ERRO ${resposta.status}`);
+                    // AQUI ESTÁ A MÁGICA: Pega exatamente o campo "error" que mandamos da Render
+                    const msgErro = dados.error || textoBruto;
+                    await sock.sendMessage(msg.key.remoteJid, { text: `🤖 *MENSAGEM DA IA:*\n${msgErro}` });
                 }
+
             } catch (erro) {
-                console.error("Falha ao comunicar com API:", erro);
+                console.error("❌ Falha crítica ao tentar conectar com a API Principal:", erro.message);
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Falha na conexão com a Render: ${erro.message}` });
             }
         }
     });

@@ -128,24 +128,25 @@ async function iniciarBot() {
                     body: JSON.stringify({ mensagem: textoMensagem })
                 });
 
-                // Lemos a resposta como texto bruto primeiro para não quebrar
                 const textoBruto = await resposta.text();
                 
                 let dados;
                 try {
                     dados = JSON.parse(textoBruto);
                 } catch (e) {
-                    dados = { error: textoBruto }; // Se não for JSON, tratamos como texto de erro
+                    dados = { error: textoBruto }; 
                 }
 
                 if (resposta.ok) {
                     console.log("✅ Render respondeu com SUCESSO!");
-                    // Imprime direto o que vier no sucesso
-                    const msgSucesso = dados.dados ? JSON.stringify(dados.dados, null, 2) : JSON.stringify(dados, null, 2);
-                    await sock.sendMessage(msg.key.remoteJid, { text: `✅ *SUCESSO:*\n${msgSucesso}` });
+                    
+                    // AQUI ESTÁ A CORREÇÃO: 
+                    // Pegamos APENAS o texto da IA (dados.respostaIA), sem transformar em JSON!
+                    const textoLimpo = dados.respostaIA || textoBruto;
+                    
+                    await sock.sendMessage(msg.key.remoteJid, { text: textoLimpo });
                 } else {
                     console.log(`⚠️ Render respondeu com ERRO ${resposta.status}`);
-                    // AQUI ESTÁ A MÁGICA: Pega exatamente o campo "error" que mandamos da Render
                     const msgErro = dados.error || textoBruto;
                     await sock.sendMessage(msg.key.remoteJid, { text: `🤖 *MENSAGEM DA IA:*\n${msgErro}` });
                 }
